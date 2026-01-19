@@ -10,7 +10,7 @@ RUN apk add --no-cache git python3 make g++
 COPY package*.json ./
 
 # Install dependencies
-RUN npm install
+RUN npm install --legacy-peer-deps
 
 # Copy source code and config
 COPY public ./public

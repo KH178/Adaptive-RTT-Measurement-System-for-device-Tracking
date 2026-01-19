@@ -11,7 +11,9 @@ COPY package*.json ./
 COPY tsconfig.json ./
 
 # Install dependencies (ignore postinstall script that tries to install client deps)
-RUN npm install --ignore-scripts
+# Then rebuild better-sqlite3 native bindings for Linux
+RUN npm install --ignore-scripts --legacy-peer-deps && \
+    npm rebuild better-sqlite3
 
 # Copy source code
 COPY src ./src

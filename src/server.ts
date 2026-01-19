@@ -15,11 +15,57 @@ import { LocalNetworkMonitor } from './local-network.js';
 import { AnalysisEngine } from './analysis.js';
 import { AnalysisWindowRow, RawMeasurementRow, TrackerData } from './types.js';
 
-// Configuration
+import fs from 'fs';
+import path from 'path';
+
+// ... existing imports ...
+
 const SIGNAL_API_URL = process.env.SIGNAL_API_URL || 'http://localhost:8080';
+const SERVER_URL = process.env.SERVER_URL || `http://localhost:${process.env.PORT || 3001}`;
+
+// Ensure profile pics directory exists
+const PROFILE_PIC_DIR = path.join(process.cwd(), 'data', 'profile_pics');
+if (!fs.existsSync(PROFILE_PIC_DIR)) {
+    fs.mkdirSync(PROFILE_PIC_DIR, { recursive: true });
+}
 
 const app = express();
 app.use(cors());
+
+// Serve static profile pictures
+app.use('/profile-pics', express.static(PROFILE_PIC_DIR));
+
+// Helper to get cached profile picture URL if it exists
+function getCachedProfilePicUrl(jid: string): string | null {
+    const filename = `${jid.replace(/[^a-zA-Z0-9]/g, '_')}.jpg`;
+    const filepath = path.join(PROFILE_PIC_DIR, filename);
+    
+    if (fs.existsSync(filepath)) {
+        return `/profile-pics/${filename}`;
+    }
+    return null;
+}
+
+// Helper to download and cache profile picture
+async function downloadAndCacheProfilePic(jid: string, url: string): Promise<string | null> {
+    try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`Failed to fetch image: ${response.statusText}`);
+        
+        const buffer = await response.arrayBuffer();
+        const filename = `${jid.replace(/[^a-zA-Z0-9]/g, '_')}.jpg`;
+        const filepath = path.join(PROFILE_PIC_DIR, filename);
+        
+        fs.writeFileSync(filepath, Buffer.from(buffer));
+        console.log(`[Server] Cached profile pic for ${jid}`);
+        
+        // Return relative URL path
+        return `/profile-pics/${filename}`;
+    } catch (err) {
+        console.error(`[Server] Error caching profile pic for ${jid}:`, err);
+        return null; 
+    }
+}
 
 const httpServer = createServer(app);
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "*";
@@ -68,12 +114,16 @@ function getLatestTrackerData(targetId: string, channel: Platform): TrackerData 
     // 1. Get latest analysis
     const analysisIdx = stmts.getLatestAnalysis.get(targetId) as AnalysisWindowRow | undefined;
     
-    // 2. Get latest raw measurement (to show current RTT even if analysis is slightly behind)
+    // 2. Get latest SUCCESSFUL raw measurement (non-timeout) to show current RTT
     const raw = db.prepare(`
         SELECT * FROM raw_measurements 
-        WHERE target_id = ? AND channel = ? 
+        WHERE target_id = ? AND channel = ? AND timeout = 0 AND target_rtt_ms IS NOT NULL
         ORDER BY timestamp DESC LIMIT 1
     `).get(targetId, channel) as RawMeasurementRow | undefined;
+    
+    // DEBUG: Log query results
+    console.log(`[DEBUG] getLatestTrackerData for ${targetId}:`);
+    console.log(`[DEBUG]   raw measurement found: ${!!raw}, rtt: ${raw?.target_rtt_ms}, timeout: ${raw?.timeout}`);
 
     // 3. Get baseline for this target
     const baseline = stmts.getBaselines.get(targetId) as any;
@@ -101,10 +151,13 @@ function getLatestTrackerData(targetId: string, channel: Platform): TrackerData 
         threshold = median + (iqr * 1.5);
     }
 
+    const finalRtt = raw && raw.target_rtt_ms ? raw.target_rtt_ms : 0;
+    console.log(`[DEBUG]   Final RTT being sent: ${finalRtt}`);
+
     // Return the full probabilistic picture
     return {
         timestamp: raw ? raw.timestamp : Date.now(),
-        rtt: raw && raw.target_rtt_ms ? raw.target_rtt_ms : 0,
+        rtt: finalRtt,
         status: status,
         state: state, // This remains the "Best Guess" text label
         avg: responsiveness * 100, // Legacy field, mapped to responsiveness %
@@ -215,37 +268,66 @@ io.on('connection', (socket) => {
     }));
 
     socket.on('get-tracked-contacts', async () => {
-        socket.emit('tracked-contacts', trackedContacts);
+        // ALWAYS get the latest list from the global map
+        const latestTrackedContacts = Array.from(trackers.entries()).map(([id, entry]) => ({
+            id,
+            platform: entry.platform
+        }));
+        socket.emit('tracked-contacts', latestTrackedContacts);
         
-        // Send initial data state
-        for (const [id, entry] of trackers.entries()) {
-             // Send profile pic if whatsapp
+        // Wait briefly to ensure client has processed the list
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+        // Fetch profile pics and data in parallel to avoid blocking
+        const updates = Array.from(trackers.entries()).map(async ([id, entry]) => {
+             // 1. Send profile pic if whatsapp
              if (entry.platform === 'whatsapp') {
                 try {
-                    console.log(`[Server] Fetching profile pic for ${id}...`);
-                    const url = await (entry.tracker as WhatsAppTracker).getProfilePicture();
-                    console.log(`[Server] Profile pic for ${id}: ${url ? 'FOUND' : 'NULL'}`);
-                    if (url) socket.emit('profile-pic', { jid: id, url });
+                    // First check if we have a cached version on disk
+                    const cachedUrl = getCachedProfilePicUrl(id);
+                    if (cachedUrl) {
+                        const fullUrl = `${SERVER_URL}${cachedUrl}`;
+                        console.log(`[Server] Sending CACHED profile pic for ${id}: ${fullUrl}`);
+                        socket.emit('profile-pic', { jid: id, url: fullUrl });
+                    } else {
+                        // No cache, try to fetch from WhatsApp
+                        console.log(`[Server] No cache for ${id}, fetching from WhatsApp...`);
+                        const remoteUrl = await (entry.tracker as WhatsAppTracker).getProfilePicture();
+                        
+                        if (remoteUrl) {
+                            console.log(`[Server] Got remote URL for ${id}, caching and emitting...`);
+                            const localUrl = await downloadAndCacheProfilePic(id, remoteUrl);
+                            if (localUrl) {
+                                const fullUrl = `${SERVER_URL}${localUrl}`;
+                                socket.emit('profile-pic', { jid: id, url: fullUrl });
+                            } else {
+                                // FALLBACK: Send remote URL if caching fails
+                                console.log(`[Server] Caching failed for ${id}, using remote URL fallback`);
+                                socket.emit('profile-pic', { jid: id, url: remoteUrl });
+                            }
+                        } else {
+                            console.log(`[Server] No profile pic available for ${id}`);
+                        }
+                    }
                 } catch (err) {
                     console.error(`[Server] Error fetching profile pic for ${id}:`, err);
                 }
              }
 
-             // Send latest data
+             // 2. Send latest data
              const data = getLatestTrackerData(id, entry.platform);
              if (data) {
-                 // Construct payload matching client/src/types.ts TrackerUpdate
                  const updatePayload = {
                      jid: id,
                      platform: entry.platform,
                      devices: [{
-                         jid: id, // Single device view for now
+                         jid: id,
                          state: data.state,
                          rtt: data.rtt,
                          avg: data.avg || 0
                      }],
                      deviceCount: 1,
-                     presence: data.state, // Map derived state to presence for now
+                     presence: data.state,
                      median: data.median || 0,
                      threshold: data.threshold || 0,
                      confidence: data.confidence,
@@ -254,7 +336,9 @@ io.on('connection', (socket) => {
                  };
                  socket.emit('tracker-update', updatePayload);
              }
-        }
+        });
+        
+        await Promise.all(updates);
     });
 
     socket.on('get-historical-data', async ({ jid, platform }: { jid: string; platform: Platform }) => {
@@ -338,16 +422,24 @@ io.on('connection', (socket) => {
 
                     // Fetch and emit profile picture
                     console.log(`[Server] Fetching profile pic for new contact ${results[0].jid}...`);
-                    const url = await tracker.getProfilePicture();
-                    console.log(`[Server] Profile pic for ${results[0].jid}: ${url ? 'FOUND' : 'NULL'}`);
-                    if (url) {
-                        socket.emit('profile-pic', { jid: results[0].jid, url });
+                    const remoteUrl = await tracker.getProfilePicture();
+                    console.log(`[Server] Profile pic for ${results[0].jid}: ${remoteUrl ? 'FOUND' : 'NULL'}`);
+                    
+                    if (remoteUrl) {
+                        // 1. Emit remote immediately for responsiveness
+                        socket.emit('profile-pic', { jid: results[0].jid, url: remoteUrl });
+
+                        // 2. Try to cache it for later
+                        downloadAndCacheProfilePic(results[0].jid, remoteUrl).catch(e => {
+                            console.error('[Server] Background cache failed:', e);
+                        });
                     }
                 }
             } catch (e) {
                 console.error('[Server] WhatsApp verification/adding failed:', e);
                 socket.emit('error', { message: 'WhatsApp verification failed' });
             }
+        
         } else if (platform === 'signal') {
              if (!isSignalConnected || !signalAccountNumber) return;
              const signalId = `signal:${cleanNumber}`;

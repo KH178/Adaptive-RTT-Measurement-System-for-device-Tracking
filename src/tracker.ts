@@ -72,6 +72,7 @@ export class WhatsAppTracker {
         try {
             return await this.sock.profilePictureUrl(this.targetJid, 'image');
         } catch (err) {
+            console.error(`[WhatsApp] Failed to get profile pic for ${this.targetJid}:`, err);
             return null;
         }
     }

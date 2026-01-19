@@ -114,6 +114,28 @@ export function Dashboard({ connectionState }: DashboardProps) {
                 const contact = next.get(data.jid);
                 if (contact) {
                     next.set(data.jid, { ...contact, profilePic: data.url });
+                } else {
+                    // Contact hasn't been added yet, create a placeholder
+                    // It will be updated when tracked-contacts or contact-added fires
+                    let displayNumber = data.jid;
+                    let platform: Platform = 'whatsapp';
+                    if (data.jid.startsWith('signal:')) {
+                        displayNumber = data.jid.replace('signal:', '');
+                        platform = 'signal';
+                    } else {
+                        displayNumber = data.jid.split('@')[0];
+                    }
+                    next.set(data.jid, {
+                        jid: data.jid,
+                        displayNumber,
+                        contactName: displayNumber,
+                        data: [],
+                        devices: [],
+                        deviceCount: 0,
+                        presence: null,
+                        profilePic: data.url,
+                        platform
+                    });
                 }
                 return next;
             });
@@ -166,7 +188,8 @@ export function Dashboard({ connectionState }: DashboardProps) {
             setContacts(prev => {
                 const next = new Map(prev);
                 trackedContactsResponse.forEach(({ id, platform }) => {
-                    if (!next.has(id)) {
+                    const existing = next.get(id);
+                    if (!existing) {
                         let displayNumber = id;
                         if (platform === 'signal') {
                             displayNumber = id.replace('signal:', '');
@@ -181,7 +204,7 @@ export function Dashboard({ connectionState }: DashboardProps) {
                             devices: [],
                             deviceCount: 0,
                             presence: null,
-                            profilePic: null,
+                            profilePic: null, // Will be populated by profile-pic event
                             platform
                         });
                         socket.emit('get-historical-data', { jid: id, platform: platform });

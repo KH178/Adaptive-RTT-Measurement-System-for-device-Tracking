@@ -18,9 +18,9 @@ try {
   try {
     execSync('docker info', { stdio: 'ignore' });
   } catch (e) {
-    console.error('Docker is not running.');
-    console.error('Please start Docker Desktop and try again.');
-    process.exit(1);
+    console.warn('Docker is not running. Skipping Signal API initialization.');
+    console.warn('   Signal tracking features will be unavailable.');
+    process.exit(0);
   }
 
   // 2. Check if container exists using 'docker inspect'
