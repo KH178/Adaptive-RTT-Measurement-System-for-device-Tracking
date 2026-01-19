@@ -215,10 +215,33 @@ let signalLinkingInProgress = false;
 let signalApiAvailable = false;
 let currentSignalQrUrl: string | null = null;
 
+async function getSignalQrCode(): Promise<string | null> {
+    try {
+        // The signal-cli-rest-api provides QR code at /v1/qrcodelink?device_name=<name>
+        // This blocks until a QR code is ready (can take a few seconds)
+        const response = await fetch(`${SIGNAL_API_URL}/v1/qrcodelink?device_name=RTT-Tracker`, {
+            signal: AbortSignal.timeout(30000) // Increased timeout - this can take a while
+        });
+        
+        if (response.ok) {
+            // Returns a PNG image as binary data - we need to convert to data URL
+            const buffer = await response.arrayBuffer();
+            const base64 = Buffer.from(buffer).toString('base64');
+            return `data:image/png;base64,${base64}`;
+        }
+    } catch (err: any) {
+        if (err.name !== 'AbortError') {
+            console.log('[SIGNAL] QR code fetch failed:', err.message || err);
+        }
+    }
+    return null;
+}
+
+let signalQrRefreshTimeout: NodeJS.Timeout | null = null;
+let lastQrFetchTime = 0;
+const QR_REFRESH_INTERVAL = 45000; // Refresh QR every 45 seconds (they expire in ~60s)
+
 async function checkSignalConnection() {
-    // ... (Keep existing Signal connection logic, simplified for brevity here if unchanged, but I'll paste the essential parts)
-    // For this refactor, I will assume the Signal logic from previous file is largely correct regarding connection checks.
-    // I will include the critical parts.
     try {
         const response = await fetch(`${SIGNAL_API_URL}/v1/about`, { signal: AbortSignal.timeout(2000) });
         const available = response.ok;
@@ -231,6 +254,7 @@ async function checkSignalConnection() {
         if (!available) {
             isSignalConnected = false;
             signalAccountNumber = null;
+            currentSignalQrUrl = null;
             return;
         }
 
@@ -239,12 +263,30 @@ async function checkSignalConnection() {
             if (!isSignalConnected) {
                 isSignalConnected = true;
                 signalAccountNumber = accounts[0];
+                currentSignalQrUrl = null; // Clear QR once connected
                 console.log(`[SIGNAL] Connected: ${signalAccountNumber}`);
                 io.emit('signal-connection-open', { number: signalAccountNumber });
             }
         } else {
+            // No accounts - need to link. Fetch QR code if not already in progress.
             isSignalConnected = false;
             signalAccountNumber = null;
+            
+            const now = Date.now();
+            const shouldRefreshQr = !currentSignalQrUrl || (now - lastQrFetchTime > QR_REFRESH_INTERVAL);
+            
+            if (!signalLinkingInProgress && shouldRefreshQr) {
+                signalLinkingInProgress = true;
+                console.log('[SIGNAL] Fetching new QR code...');
+                const qrUrl = await getSignalQrCode();
+                if (qrUrl) {
+                    currentSignalQrUrl = qrUrl;
+                    lastQrFetchTime = Date.now();
+                    console.log('[SIGNAL] QR code available, emitting to clients');
+                    io.emit('signal-qr-image', qrUrl);
+                }
+                signalLinkingInProgress = false;
+            }
         }
     } catch (err) {
         isSignalConnected = false;
@@ -259,6 +301,7 @@ io.on('connection', (socket) => {
     if (currentWhatsAppQr) socket.emit('qr', currentWhatsAppQr);
     if (isWhatsAppConnected) socket.emit('connection-open');
     if (isSignalConnected && signalAccountNumber) socket.emit('signal-connection-open', { number: signalAccountNumber });
+    if (currentSignalQrUrl) socket.emit('signal-qr-image', currentSignalQrUrl);
     socket.emit('signal-api-status', { available: signalApiAvailable });
     socket.emit('probe-method', globalProbeMethod);
 
